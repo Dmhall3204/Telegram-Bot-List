@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: conductor, namespace: conductor, labels: {app: conductor}}
+spec:
+  replicas: 3
+  selector: {matchLabels: {app: conductor}}
+  strategy: {rollingUpdate: {maxUnavailable: 0, maxSurge: 1}}
+  template:
+    metadata:
+      labels: {app: conductor}
+      annotations: {prometheus.io/scrape: "true", prometheus.io/port: "8080"}
+    spec:
+      securityContext: {runAsNonRoot: true, runAsUser: 10001}
+      containers:
+        - name: conductor
+          image: ghcr.io/dmhall3204/conductor:0.3.0
+          ports: [{containerPort: 8080, name: http}]
+          env:
+            - {name: CONDUCTOR_URL, value: "http://vllm-conductor:8000/v1"}
+            - {name: FAST_URL, value: "http://vllm-fast:8000/v1"}
+            - {name: CODE_URL, value: "http://vllm-code:8000/v1"}
+            - {name: REASONING_URL, value: "http://vllm-reasoning:8000/v1"}
+            - {name: VISION_URL, value: "http://vllm-vision:8000/v1"}
+            - {name: LONG_CTX_URL, value: "http://vllm-long-ctx:8000/v1"}
+            - {name: MONITOR_STORE, value: redis}
+            - {name: REDIS_URL, value: "redis://redis:6379/0"}
+            - {name: VLLM_API_KEY, valueFrom: {secretKeyRef: {name: conductor-secrets, key: vllm-api-key}}}
+            - {name: CONDUCTOR_API_KEYS, valueFrom: {secretKeyRef: {name: conductor-secrets, key: conductor-api-keys}}}
+          resources: {requests: {cpu: "1", memory: 512Mi}, limits: {memory: 1Gi}}
+          readinessProbe: {httpGet: {path: /readyz, port: 8080}, periodSeconds: 10, timeoutSeconds: 5}
+          livenessProbe: {httpGet: {path: /healthz, port: 8080}, periodSeconds: 15}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: conductor, namespace: conductor}
+spec:
+  selector: {app: conductor}
+  ports: [{port: 80, targetPort: 8080, name: http}]
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: conductor, namespace: conductor}
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: conductor}
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource: {name: cpu, target: {type: Utilization, averageUtilization: 60}}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: conductor, namespace: conductor}
+spec:
+  minAvailable: 2
+  selector: {matchLabels: {app: conductor}}

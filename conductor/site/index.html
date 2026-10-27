@@ -1,0 +1,533 @@
+<title>Conductor Architecture</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<meta name="description" content="A sparse MoE Conductor directing a pool of MoE specialists: three stacked softmaxes per request.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@112,600;112,800&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: a single spec-sheet column on a faint routing grid; figures break wider; tier colour encodes L0 / L1 / L2 / fast throughout. */
+:root {
+  --paper: #f3f5f8;
+  --sheet: #ffffff;
+  --ink: #142033;
+  --ink-2: #4a5a72;
+  --rule: #d5dce6;
+  --grid: rgba(40, 70, 120, 0.06);
+  --l0: #4a3fd1;
+  --l1: #0e7f78;
+  --l2: #5b6b85;
+  --fast: #b07a06;
+  --l0-soft: #ebe9fd;
+  --l1-soft: #e2f4f2;
+  --l2-soft: #eceff4;
+  --fast-soft: #fbf1d9;
+  --display: "Archivo", "Arial Narrow", system-ui, sans-serif;
+  --body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #0d1420; --sheet: #121b2a; --ink: #e4eaf3; --ink-2: #9aa9bf; --rule: #24324a;
+    --grid: rgba(140, 170, 220, 0.05);
+    --l0: #9d94ff; --l1: #3fc7bc; --l2: #93a3bd; --fast: #e8b645;
+    --l0-soft: #221f4a; --l1-soft: #0f2e2d; --l2-soft: #1b2536; --fast-soft: #33280d;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #0d1420; --sheet: #121b2a; --ink: #e4eaf3; --ink-2: #9aa9bf; --rule: #24324a;
+  --grid: rgba(140, 170, 220, 0.05);
+  --l0: #9d94ff; --l1: #3fc7bc; --l2: #93a3bd; --fast: #e8b645;
+  --l0-soft: #221f4a; --l1-soft: #0f2e2d; --l2-soft: #1b2536; --fast-soft: #33280d;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+body {
+  background: var(--paper);
+  background-image: linear-gradient(var(--grid) 1px, transparent 1px), linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 24px 24px;
+  color: var(--ink);
+  font: 400 16px/1.6 var(--body);
+}
+.wrap {
+  max-width: 1080px; margin: 0 auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 40px 72px;
+  display: grid; gap: 64px;
+}
+h1, h2, h3 { font-family: var(--display); font-stretch: 112%; text-wrap: balance; margin: 0; }
+h1 { font-size: clamp(2rem, 5.2vw, 3.4rem); font-weight: 800; line-height: 1.04; letter-spacing: -0.01em; }
+h2 { font-size: clamp(1.45rem, 3vw, 2rem); font-weight: 800; line-height: 1.12; }
+h3 { font-size: 1.08rem; font-weight: 600; line-height: 1.25; }
+p { margin: 0; max-width: 66ch; }
+code, .mono { font-family: var(--mono); font-size: 0.86em; }
+.label { font: 500 0.72rem/1.3 var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-2); }
+.section { display: grid; gap: 20px; }
+.section > header { display: grid; gap: 8px; }
+.lede { font-size: 1.12rem; color: var(--ink-2); }
+.stack { display: grid; gap: 14px; }
+
+/* hero */
+.hero { display: grid; gap: 22px; }
+.hero .version { display: flex; flex-wrap: wrap; gap: 8px 18px; align-items: baseline; }
+.softmax { font-family: var(--mono); font-size: 0.95rem; color: var(--ink-2); }
+.softmax b { font-weight: 500; }
+.specs { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); border-top: 2px solid var(--ink); }
+.specs > div { padding: 12px 16px 12px 0; display: grid; gap: 2px; border-bottom: 1px solid var(--rule); }
+.specs strong { font: 600 1.05rem/1.3 var(--display); font-stretch: 112%; }
+
+.note { background: var(--sheet); border: 1px solid var(--rule); border-left: 3px solid var(--l0); padding: 16px 18px; display: grid; gap: 6px; max-width: 76ch; }
+.note p { color: var(--ink-2); }
+
+/* tier colour helpers */
+.t-l0 { --c: var(--l0); --s: var(--l0-soft); }
+.t-l1 { --c: var(--l1); --s: var(--l1-soft); }
+.t-l2 { --c: var(--l2); --s: var(--l2-soft); }
+.t-fast { --c: var(--fast); --s: var(--fast-soft); }
+.chip { display: inline-flex; align-items: center; gap: 6px; font: 500 0.7rem/1 var(--mono); letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--c); background: var(--s); padding: 5px 8px; border-radius: 3px; white-space: nowrap; }
+
+/* figure */
+figure { margin: 0; display: grid; gap: 12px; }
+.fig-scroll { overflow-x: auto; background: var(--sheet); border: 1px solid var(--rule); }
+.fig { min-width: 820px; display: grid; grid-template-columns: 92px 1fr; }
+.fig .time { border-right: 1px solid var(--rule); font: 500 0.7rem/1.2 var(--mono); color: var(--ink-2); padding: 14px 10px; display: grid; gap: 4px; align-content: start; }
+.fig .time b { color: var(--ink); font-weight: 500; letter-spacing: 0.06em; }
+.fig .row { padding: 14px 18px; border-bottom: 1px dashed var(--rule); display: grid; gap: 10px; }
+.fig .row:last-child, .fig .time:nth-last-child(2) { border-bottom: 0; }
+.fig .time { border-bottom: 1px dashed var(--rule); }
+.box { border: 1.5px solid var(--c, var(--rule)); background: var(--s, transparent); padding: 10px 12px; display: grid; gap: 4px; min-width: 0; }
+.box .k { font: 500 0.68rem/1.2 var(--mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--c, var(--ink-2)); }
+.box .v { font-size: 0.86rem; color: var(--ink-2); line-height: 1.45; }
+.box h3 { font-size: 0.98rem; }
+.l0box { display: grid; grid-template-columns: 1.3fr 1fr 1.2fr; gap: 12px; }
+pre.json { margin: 0; font: 400 0.76rem/1.5 var(--mono); color: var(--ink); white-space: pre; }
+.bus { display: grid; grid-template-columns: repeat(4, 1fr) 1fr; gap: 10px; align-items: end; }
+.bus .lane { display: grid; gap: 4px; justify-items: center; font: 500 0.72rem/1.2 var(--mono); color: var(--ink-2); }
+.bus .bar { width: 100%; height: 8px; background: var(--rule); position: relative; }
+.bus .bar i { position: absolute; inset: 0 auto 0 0; background: var(--c); }
+.bus .lane.off { opacity: 0.55; }
+.l1row { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }
+.l1row .box .num { font: 600 0.7rem/1 var(--mono); color: var(--c); }
+.l2row { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }
+.l2row .box { text-align: center; }
+.l2row strong { font: 600 1.05rem/1.2 var(--mono); color: var(--c); }
+.dispatch-label { font: 500 0.72rem/1.3 var(--mono); color: var(--ink-2); letter-spacing: 0.04em; }
+figcaption { font-size: 0.9rem; color: var(--ink-2); max-width: 80ch; }
+.legend { display: flex; flex-wrap: wrap; gap: 8px; }
+
+/* cards */
+.grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+.card { background: var(--sheet); border: 1px solid var(--rule); border-top: 3px solid var(--c, var(--ink)); padding: 18px 20px 20px; display: grid; gap: 10px; align-content: start; min-width: 0; }
+.card .meta { font: 400 0.8rem/1.5 var(--mono); color: var(--ink-2); }
+.card p { font-size: 0.95rem; }
+.card .role { font: 500 0.74rem/1.3 var(--mono); letter-spacing: 0.05em; text-transform: uppercase; color: var(--c); }
+dl.kv { margin: 0; display: grid; grid-template-columns: minmax(130px, max-content) 1fr; gap: 6px 16px; font-size: 0.88rem; }
+dl.kv dt { font: 500 0.7rem/1.6 var(--mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-2); }
+dl.kv dd { margin: 0; min-width: 0; }
+
+/* conductor block */
+.conductor { background: var(--sheet); border: 1.5px solid var(--l0); display: grid; grid-template-columns: 1.1fr 1fr; }
+.conductor > div { padding: 22px; display: grid; gap: 12px; align-content: start; min-width: 0; }
+.conductor > div + div { border-left: 1px solid var(--rule); background: var(--l0-soft); }
+
+/* techniques */
+.tech { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 0; border-top: 2px solid var(--ink); }
+.tech article { padding: 18px 20px 20px 0; border-bottom: 1px solid var(--rule); display: grid; gap: 8px; align-content: start; }
+.tech .analog { font: 400 0.8rem/1.4 var(--mono); color: var(--l0); }
+.tech code { color: var(--ink-2); }
+
+/* simulator */
+.sim { background: var(--sheet); border: 1px solid var(--rule); display: grid; grid-template-columns: 1fr 1fr; }
+.sim > div { padding: 20px; display: grid; gap: 14px; align-content: start; min-width: 0; }
+.sim > div + div { border-left: 1px solid var(--rule); }
+.sim textarea { width: 100%; min-height: 96px; resize: vertical; font: 400 0.95rem/1.5 var(--body); color: var(--ink); background: var(--paper);
+  border: 1px solid var(--rule); padding: 10px 12px; }
+.sim textarea:focus-visible, .sim button:focus-visible, .sim input:focus-visible { outline: 2px solid var(--l0); outline-offset: 2px; }
+.sim .controls { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; font-size: 0.9rem; }
+.sim .examples { display: flex; flex-wrap: wrap; gap: 6px; }
+.sim button { font: 500 0.78rem/1 var(--mono); color: var(--ink); background: var(--paper); border: 1px solid var(--rule); padding: 7px 10px; cursor: pointer; }
+.sim button:hover { border-color: var(--l0); color: var(--l0); }
+.bars { display: grid; gap: 8px; }
+.bars .b { display: grid; grid-template-columns: 78px 1fr 52px; gap: 10px; align-items: center; font: 500 0.78rem/1 var(--mono); }
+.bars .track { height: 14px; background: var(--l2-soft); position: relative; }
+.bars .track i { position: absolute; inset: 0 auto 0 0; background: var(--l2); transition: width 0.25s ease; }
+.bars .b.on .track i { background: var(--l1); }
+.bars .b .p { text-align: right; font-variant-numeric: tabular-nums; }
+.bars .thr { position: absolute; top: -3px; bottom: -3px; width: 0; border-left: 1px dashed var(--ink-2); }
+.verdict { display: grid; gap: 6px; font-size: 0.92rem; }
+.verdict .path { font: 600 1.05rem/1.2 var(--display); font-stretch: 112%; }
+.verdict ul { margin: 0; padding-left: 18px; color: var(--ink-2); font-size: 0.86rem; }
+
+/* tables */
+.tbl { overflow-x: auto; border-top: 2px solid var(--ink); }
+table { border-collapse: collapse; width: 100%; min-width: 640px; font-size: 0.9rem; }
+th, td { text-align: left; padding: 10px 14px 10px 0; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { font: 500 0.7rem/1.3 var(--mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-2); }
+td.n { font-variant-numeric: tabular-nums; font-family: var(--mono); font-size: 0.84rem; white-space: nowrap; }
+
+.commit { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+.commit .card { --c: var(--ink); }
+footer { font-size: 0.85rem; color: var(--ink-2); border-top: 1px solid var(--rule); padding-top: 16px; display: flex; flex-wrap: wrap; gap: 8px 24px; }
+
+@media (max-width: 760px) {
+  .conductor, .sim { grid-template-columns: 1fr; }
+  .conductor > div + div, .sim > div + div { border-left: 0; border-top: 1px solid var(--rule); }
+  .wrap { gap: 48px; padding-block: 28px 56px; }
+}
+@media (prefers-reduced-motion: reduce) { .bars .track i { transition: none; } }
+</style>
+
+<main class="wrap">
+
+  <section class="hero">
+    <div class="version"><span class="label">db2productions · Conductor</span><span class="chip t-l0">v0.3 · Production</span></div>
+    <h1>A mixture of experts, directing a mixture of mixtures of experts.</h1>
+    <p class="lede">A Qwen3-class sparse MoE Conductor with 128 internal experts sends every query to a pool of five specialists: four MoE models and one dense fast path. Each MoE specialist then runs its own token-level gating across its own experts. The Conductor combines, weights and synthesises what they return.</p>
+    <p class="softmax"><b style="color:var(--l0)">softmax₀</b>(cluster) → <b style="color:var(--l1)">softmax₁</b>(expert) → <b style="color:var(--l2)">softmax₂</b>(token)</p>
+    <div class="specs">
+      <div><span class="label">Orchestration tiers</span><strong>L0 Conductor + L1 Specialists</strong></div>
+      <div><span class="label">Specialist models</span><strong>4 MoE + 1 dense</strong></div>
+      <div><span class="label">Capacity factor</span><strong>k ≤ 2 per request</strong></div>
+      <div><span class="label">Infrastructure</span><strong>Self-hosted · open weights</strong></div>
+    </div>
+    <div class="note">
+      <span class="label">How a request moves</span>
+      <p>The Conductor reads every query and emits a weighted distribution over specialist clusters. The selected specialists fire in parallel, and each one routes tokens through its own internal expert gate. A fast path fires alongside on every request and sets a latency floor. When more than one specialist answers, the Conductor runs again as the synthesiser and merges their outputs, weighted by its original routing confidence.</p>
+    </div>
+  </section>
+
+  <section class="section" id="architecture">
+    <header>
+      <span class="label">§ 01 · Architecture</span>
+      <h2>Two orchestration tiers of gating, plus one inherited.</h2>
+      <p>The framework routes coarsely across four specialist clusters at L0, and an always-on fast path runs beside them. Every selected MoE model then does its own learned token-level gating at L2. That tier comes free with choosing sparse-activation specialists. This is hierarchical MoE lifted from the layer level to the system level.</p>
+    </header>
+
+    <figure>
+      <span class="label">Fig. 01 · Orchestration flow</span>
+      <div class="fig-scroll">
+        <div class="fig">
+          <div class="time"><b>INPUT</b>t = 0</div>
+          <div class="row">
+            <div class="box"><span class="k">user query</span><span class="v">text · images · long context. Attachments are opaque to the routing layer, which sees only counts and a bounded clip.</span></div>
+          </div>
+
+          <div class="time"><b>L0</b>~50 ms</div>
+          <div class="row">
+            <div class="l0box">
+              <div class="box t-l0"><span class="k">L0 · Conductor (MoE)</span><h3>Sparse MoE · 128 experts · top-8</h3><span class="v">Reads the query, classifies intent, emits a cluster softmax. The same weights run again as synthesiser at merge.</span></div>
+              <div class="box"><span class="k">Input contract</span><span class="v">raw query text (clipped)<br>attachment counts<br>context-size estimate<br>recent history</span></div>
+              <div class="box t-l0"><span class="k">Routing decision · guided JSON</span>
+<pre class="json">{"weights": {"code": 0.05, "reasoning": 0.72,
+             "vision": 0.18, "long_ctx": 0.05},
+ "trivial": false, "synthesise": true,
+ "subqueries": {"reasoning": "…", "vision": "…"}}</pre></div>
+            </div>
+          </div>
+
+          <div class="time"><b>L0 → L1</b>~200 ms</div>
+          <div class="row">
+            <span class="dispatch-label">DISPATCH BUS · async fan-out · capacity factor = 2 · min weight 0.10</span>
+            <div class="bus">
+              <div class="lane off t-l1"><span>w = 0.05</span><div class="bar"><i style="width:5%"></i></div><span>CODE</span></div>
+              <div class="lane t-l1"><span>w = 0.72</span><div class="bar"><i style="width:72%"></i></div><span>REASONING ✓</span></div>
+              <div class="lane t-l1"><span>w = 0.18</span><div class="bar"><i style="width:18%"></i></div><span>VISION ✓</span></div>
+              <div class="lane off t-l1"><span>w = 0.05</span><div class="bar"><i style="width:5%"></i></div><span>LONG-CTX</span></div>
+              <div class="lane t-fast"><span>always</span><div class="bar"><i style="width:100%"></i></div><span>FAST · bypasses router</span></div>
+            </div>
+          </div>
+
+          <div class="time"><b>L1</b>parallel</div>
+          <div class="row">
+            <div class="l1row">
+              <div class="box t-l1"><span class="num">01</span><h3>Code (MoE)</h3><span class="v">30.5B / 3.3B active<br>128 experts · top-8<br>256K ctx · tool calling</span></div>
+              <div class="box t-l1"><span class="num">02</span><h3>Reasoning (MoE)</h3><span class="v">80B / 3B active<br>512 + 1 shared · top-10<br>Gated DeltaNet + attn 3:1</span></div>
+              <div class="box t-l1"><span class="num">03</span><h3>Vision (MoE)</h3><span class="v">31B / 3B active<br>VL-MoE · native<br>BF16 vision tower</span></div>
+              <div class="box t-l1"><span class="num">04</span><h3>Long-Context (MoE)</h3><span class="v">30.5B / 3.3B active<br>256K native · 1M YaRN<br>RAG · long docs</span></div>
+              <div class="box t-fast"><span class="num">FAST</span><h3>Latency Floor</h3><span class="v">4B dense<br>no internal gating<br>sub-200 ms TTFT target</span></div>
+            </div>
+          </div>
+
+          <div class="time"><b>L2</b>per token</div>
+          <div class="row">
+            <span class="dispatch-label">INHERITED TOKEN-LEVEL GATING · each MoE specialist routes every token through its own learned sparse gate</span>
+            <div class="l2row">
+              <div class="box t-l2"><strong>8 / 128</strong><span class="v">per token · 01</span></div>
+              <div class="box t-l2"><strong>10+1 / 513</strong><span class="v">per token · 02</span></div>
+              <div class="box t-l2"><strong>8 / 128</strong><span class="v">per token · 03</span></div>
+              <div class="box t-l2"><strong>8 / 128</strong><span class="v">per token · 04</span></div>
+              <div class="box t-fast"><strong>dense</strong><span class="v">bypasses L2</span></div>
+            </div>
+          </div>
+
+          <div class="time"><b>MERGE</b>~1.2 s</div>
+          <div class="row">
+            <div class="box t-l0"><span class="k">Weighted synthesis · L0 re-invoked</span><span class="v">Outputs are merged using the original routing probabilities. Skipped when k = 1, and that specialist streams straight to the user. When k &gt; 1 the fast-path answer is attached as low-trust context. The response streams to the user.</span></div>
+          </div>
+        </div>
+      </div>
+      <figcaption>Fig. 01. The Conductor emits a softmax over clusters. The top-k specialists fire in parallel, bounded by the capacity factor. The fast path (gold) runs alongside on every request. The Conductor runs again as synthesiser and merges outputs weighted by their routing probabilities. Timings are targets for a warm pool.</figcaption>
+      <div class="legend"><span class="chip t-l0">L0 · Conductor</span><span class="chip t-l1">L1 · Specialists</span><span class="chip t-l2">L2 · Internal MoE</span><span class="chip t-fast">Fast · shadow</span></div>
+    </figure>
+  </section>
+
+  <section class="section" id="conductor">
+    <header>
+      <span class="label">§ 02 · L0 · Conductor</span>
+      <h2>The top-level gate.</h2>
+      <p>The Conductor is the only model that reads every query. It is a sparse MoE itself, with 128 experts and top-8 routing, so even the routing decision comes from an internal expert gate rather than a dense forward pass. About 3.3B parameters activate per token, which keeps a call on every request cheap. It always emits a full distribution over clusters, never a hard pick.</p>
+    </header>
+    <div class="conductor">
+      <div>
+        <span class="chip t-l0">Tier L0</span>
+        <h3>Conductor · Qwen3-30B-A3B class</h3>
+        <p class="mono" style="color:var(--ink-2)">30.5B total · 3.3B active · 128 experts · top-8 · 32K native (131K via YaRN)</p>
+        <p>The Conductor reads the query, classifies intent, splits it into per-cluster subqueries, and emits a probability distribution across the clusters. When more than one cluster fires, the same model runs again as the synthesiser. Each specialist output reaches it annotated with that cluster's probability, so the merge is weighted rather than a flat concatenation. That gives two roles from one model and one warm pool.</p>
+      </div>
+      <div>
+        <dl class="kv">
+          <dt>Architecture</dt><dd>Sparse MoE · 128 experts · 8 active per token</dd>
+          <dt>Structured output</dt><dd>JSON-schema guided decoding (xgrammar / outlines)</dd>
+          <dt>Invoked at</dt><dd>L0 routing · weighted synthesis</dd>
+          <dt>Input bound</dt><dd>Head + tail clip of the query, attachment counts and a token estimate. Its window never overflows.</dd>
+          <dt>Prompt caching</dt><dd>Routing system prompt prefix-cached</dd>
+          <dt>Fallback</dt><dd>Retry once on malformed JSON, then use the fast path</dd>
+        </dl>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="specialists">
+    <header>
+      <span class="label">§ 03 · L1 · Specialist models</span>
+      <h2>Five specialists, all open-weight.</h2>
+      <p>Every specialist except the fast path is a Mixture-of-Experts. The current rotation comes from the Qwen3 family and changes as better open-weight options ship. The stable part is the shape of the pool: each role, its architecture class, and the behaviour the role must guarantee. Specific checkpoints are an implementation detail.</p>
+    </header>
+    <div class="grid-2">
+      <article class="card t-l1">
+        <span class="role">01 · Code · agentic</span>
+        <h3>Code Specialist</h3>
+        <span class="meta">Qwen3-Coder-30B-A3B-Instruct · 30.5B / 3.3B active · 128 experts · 256K native (1M via YaRN)</span>
+        <p>Agentic code and repo-scale reasoning, with native function calling and tool use. Tuned for instruction-following without a thinking pass. Code screenshots are read by the Vision Specialist, and the two outputs merge at synthesis.</p>
+      </article>
+      <article class="card t-l1">
+        <span class="role">02 · Reasoning · thinking mode</span>
+        <h3>Reasoning Specialist</h3>
+        <span class="meta">Qwen3-Next-80B-A3B-Thinking · 80B / 3B active · 512 + 1 shared experts · 262K ctx</span>
+        <p>A hybrid MoE with Gated DeltaNet and Gated Attention layers in a 3:1 ratio, built for chain-of-thought. Only about 3B of its 80B parameters activate per token, so a request costs less than the size suggests. It thinks before it answers, and that trace stays internal unless the user asks to see it.</p>
+      </article>
+      <article class="card t-l1">
+        <span class="role">03 · Vision · multimodal</span>
+        <h3>Vision Specialist</h3>
+        <span class="meta">Qwen3-VL-30B-A3B-Instruct · 31B / 3B active · VL-MoE · served in BF16</span>
+        <p>Handles images, OCR, charts, screenshots and visual Q&amp;A natively, with no external OCR pipeline in front of it. The vision tower runs at full precision. Any request with an image attached always includes this specialist.</p>
+      </article>
+      <article class="card t-l1">
+        <span class="role">04 · Long context · RAG</span>
+        <h3>Long-Context Specialist</h3>
+        <span class="meta">Qwen3-30B-A3B-Instruct-2507 · 30.5B / 3.3B active · 256K native (1M via YaRN)</span>
+        <p>Handles RAG payloads, full codebases, long transcripts and multi-document summaries. It shares its weight topology with the Conductor but does a different job: retrieval and long-document synthesis, not classification. Context past the threshold always includes it.</p>
+      </article>
+      <article class="card t-fast">
+        <span class="role">Fast · shadow</span>
+        <h3>Latency Floor</h3>
+        <span class="meta">Qwen3-4B-Instruct-2507 · 4B dense · no internal gating · sub-200 ms TTFT target</span>
+        <p>Dense on purpose: dense models reach the first token sooner. It fires on every request alongside L0. Trivial queries get its answer directly. For complex queries its answer goes into the synthesis prompt as context, and it is never used as a blind fallback.</p>
+      </article>
+      <div class="note" style="align-self:start">
+        <span class="label">Why the lineup works</span>
+        <p>The four MoE specialists each activate about 3B parameters per token. Even with two firing in parallel, the compute load is close to running a small model. The 80B reasoning specialist has the most capacity, but at 3B active it doesn't dominate latency or cost. The dense fast path stays under 5B and has no gating overhead.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="clusters">
+    <header>
+      <span class="label">§ 04 · Cluster organisation</span>
+      <h2>Four routable clusters, one always on.</h2>
+      <p>The router can send work to four clusters: code, reasoning, vision and long-ctx. The fifth, fast, is never routed to. It fires on every request, outside the capacity budget. That keeps cost accounting clean: capacity is bounded on the routable side, and the shadow path is a constant.</p>
+    </header>
+    <div class="tbl">
+      <table>
+        <thead><tr><th>Cluster</th><th>Covers</th><th>Specialist</th><th>Forced when</th></tr></thead>
+        <tbody>
+          <tr><td><span class="chip t-l1">code</span></td><td>Agentic coding, debugging, tool use, shell, SQL, function calling, repository-scale reasoning</td><td>01 Code</td><td>never</td></tr>
+          <tr><td><span class="chip t-l1">reasoning</span></td><td>Math, logic, multi-step analysis, planning, using a thinking-mode chain of thought</td><td>02 Reasoning</td><td>never</td></tr>
+          <tr><td><span class="chip t-l1">vision</span></td><td>Images, charts, diagrams, OCR, screenshots, visual Q&amp;A</td><td>03 Vision</td><td>an image is attached</td></tr>
+          <tr><td><span class="chip t-l1">long_ctx</span></td><td>RAG payloads, long documents, full codebases, transcripts</td><td>04 Long-Context</td><td>context ≥ 24K tokens</td></tr>
+          <tr><td><span class="chip t-fast">fast</span></td><td>Never routed to. Fires in parallel with L0 on every request and sits outside the capacity budget.</td><td>Latency Floor</td><td>always</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="section" id="techniques">
+    <header>
+      <span class="label">§ 05 · The sophistication layer</span>
+      <h2>Six MoE techniques, applied to orchestration.</h2>
+      <p>Each technique below comes from the MoE training and serving literature. Each one maps onto a concrete behaviour of the system, implemented in the reference service.</p>
+    </header>
+    <div class="tech">
+      <article><h3>Soft routing with weights</h3><p>L0 emits a full softmax over the routable clusters. Clusters at p ≥ 0.10 are candidates, and the synthesiser uses their probabilities as merge priors.</p><span class="analog">↳ top-k gating · <code>router.plan</code></span></article>
+      <article><h3>Capacity factor</h3><p>At most 2 concurrent L1 specialists per request, separate from the always-on shadow. If three clusters clear the threshold, only the top two fire. An open circuit breaker passes its slot to the next-ranked cluster.</p><span class="analog">↳ expert capacity limit · <code>capacity_factor: 2</code></span></article>
+      <article><h3>Load-balance surveillance</h3><p>Every specialist invocation is counted. If a cluster's share of routable traffic falls below 5% or rises above 60% over a rolling 24 hours, an alert fires and the router prompt gets reviewed.</p><span class="analog">↳ auxiliary load-balancing loss · <code>Monitor</code></span></article>
+      <article><h3>Shadow path as latency floor</h3><p>The Latency Floor fires on every request, outside the capacity budget, and streams into a buffer. Trivial queries replay it live. Complex ones attach it to synthesis. A specialist that fails before its first token falls back to it.</p><span class="analog">↳ shared expert with guaranteed activation · <code>FastShadow</code></span></article>
+      <article><h3>Probability-weighted synthesis</h3><p>When k &gt; 1 specialists answer, the synthesis prompt lists each output in weight order, annotated with its probability. The synthesiser is primed to trust higher-weighted outputs more. This happens in the forward pass only, with no gradients.</p><span class="analog">↳ gated expert combination · <code>_synthesis_messages</code></span></article>
+      <article><h3>Routing-collapse detection</h3><p>A real-time monitor flags pathological distributions: one cluster above 80% or any below 2% over the last hour. It then switches every replica to uniform-mix routing for 15 minutes and requests a manual prompt review.</p><span class="analog">↳ dead-expert detection · <code>uniform_hold_s</code></span></article>
+    </div>
+  </section>
+
+  <section class="section" id="simulator">
+    <header>
+      <span class="label">Try the planner</span>
+      <h2>Watch the L0 softmax become a plan.</h2>
+      <p>This runs the same planning rules as the service: normalise, apply forced clusters, keep p ≥ 0.10, cap at two, renormalise for merge. The softmax here comes from a keyword stand-in for the Conductor model, the same heuristic the test suite's mock uses. Real routing quality depends on the deployed model.</p>
+    </header>
+    <div class="sim">
+      <div>
+        <label class="label" for="q">Query</label>
+        <textarea id="q">Prove the algorithm is optimal, then write the Python function and fix the bug in my script</textarea>
+        <div class="controls">
+          <label><input type="checkbox" id="img"> Image attached</label>
+          <label><input type="checkbox" id="long"> Context over 24K tokens</label>
+          <label><input type="checkbox" id="collapse"> Collapse fallback active</label>
+        </div>
+        <div class="examples" aria-label="Example queries">
+          <button type="button" data-q="hello">hello</button>
+          <button type="button" data-q="Solve this probability puzzle and derive the equation">reasoning</button>
+          <button type="button" data-q="What does the chart in this screenshot show?" data-img="1">vision</button>
+          <button type="button" data-q="Summarize this contract and report every renewal clause" data-long="1">long context</button>
+        </div>
+      </div>
+      <div>
+        <span class="label">L0 distribution</span>
+        <div class="bars" id="bars"></div>
+        <div class="verdict" id="verdict" aria-live="polite"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="implementation">
+    <header>
+      <span class="label">Reference implementation</span>
+      <h2>What ships in <code>conductor/</code>.</h2>
+      <p>An async Python service with an OpenAI-compatible API, in front of six vLLM servers. It also runs against mock backends with no GPUs, and that is how its test suite runs.</p>
+    </header>
+    <div class="tbl">
+      <table>
+        <thead><tr><th>Module</th><th>Responsibility</th></tr></thead>
+        <tbody>
+          <tr><td class="n">router.py</td><td>Guided-JSON L0 call with one retry. Planner with forced clusters, min weight, capacity factor and breaker-aware top-k.</td></tr>
+          <tr><td class="n">orchestrator.py</td><td>Fast-path shadow, parallel fan-out, k = 1 direct return, weighted synthesis, streaming, graceful degradation at every stage.</td></tr>
+          <tr><td class="n">monitor.py</td><td>Bucketed counters in memory or Redis, the 24h balance and 1h collapse windows, the shared uniform-mode flag, de-duplicated alerts with a webhook.</td></tr>
+          <tr><td class="n">breaker.py</td><td>A per-specialist circuit breaker (closed, open, half-open) that releases its probe slot on cancellation.</td></tr>
+          <tr><td class="n">telemetry.py</td><td>Prometheus metrics for stage latency, route probabilities, capacity drops, breakers, load share and fast-path TTFT. OpenTelemetry spans.</td></tr>
+          <tr><td class="n">server.py</td><td><code>/v1/chat/completions</code> (SSE), <code>/v1/route</code>, <code>/v1/pool</code>, <code>/v1/monitor</code>, <code>/metrics</code>, health and readiness, bearer-key auth.</td></tr>
+          <tr><td class="n">deploy/</td><td>Single-node compose for 6 × 80 GB GPUs, Kubernetes manifests (GPU deployments, HPA, PDB, Redis), Prometheus alert rules.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="section" id="commitments">
+    <header>
+      <span class="label">§ 06 · Commitments</span>
+      <h2>Private. Open-weight. User-funded.</h2>
+      <p>db2productions is funded directly by its users. Subscription revenue pays for the three things that make the product better: stronger models, lower latency, and a cleaner product. There are no ads, no data sales, and no upstream vendor deciding what you can or can't ask.</p>
+    </header>
+    <div class="commit">
+      <article class="card"><span class="role">Better models</span><p>We swap in newer, stronger open-weight specialists as soon as they prove out on our evaluations. The framework is model-agnostic by design. The roles stay fixed while the checkpoints behind them change.</p></article>
+      <article class="card"><span class="role">Lower latency</span><p>Warmer pools at peak hours, faster hardware as it becomes viable, better caching and streaming. Every fraction of a second saved is a measurable win for the person waiting on a response.</p></article>
+      <article class="card"><span class="role">Better experience</span><p>Cleaner chat, richer history, better exports, a more responsive mobile app, better prompt tooling. The interface is where you spend your time, so it gets real investment.</p></article>
+      <article class="card"><span class="role">Private · self-hosted</span><p>Every specialist runs on inference infrastructure db2productions operates directly. Nothing is routed through consumer AI APIs. Conversations are not logged for training. When you delete your history, it is purged from active storage immediately and from backups within 30 days.</p></article>
+      <article class="card"><span class="role">Open · auditable</span><p>Every specialist in the pool is an open-weight model under the Apache-2.0 licence. There are no proprietary black boxes, no vendor lock-in and no sudden API deprecations. The framework layer is proprietary, and the model layer can be audited by anyone.</p></article>
+    </div>
+  </section>
+
+  <footer><span>Conductor v0.3</span><span>Three stacked softmaxes per request: cluster, expert, token.</span></footer>
+</main>
+
+<script>
+(() => {
+  const CLUSTERS = ["code", "reasoning", "vision", "long_ctx"];
+  const KEYWORDS = {
+    code: ["code", "function", "bug", "python", "javascript", "sql", "compile", "stack trace", "refactor", "api", "regex", "script"],
+    reasoning: ["prove", "proof", "math", "solve", "logic", "probability", "plan", "why", "derive", "equation", "puzzle", "optimal"],
+    vision: ["image", "screenshot", "chart", "photo", "diagram", "ocr", "picture"],
+    long_ctx: ["document", "transcript", "summarize", "summarise", "codebase", "report", "pdf", "chapter", "contract"]
+  };
+  const TRIVIAL = ["hi", "hello", "hey", "thanks", "thank you", "good morning", "what time"];
+  const MIN_W = 0.10, CAP = 2, MIX = 0.5;
+  const $ = (id) => document.getElementById(id);
+  const count = (text, k) => text.split(k).length - 1;
+
+  function conductor(query, images) {
+    const q = query.toLowerCase();
+    const s = {};
+    CLUSTERS.forEach((c) => { s[c] = 0.05 + KEYWORDS[c].reduce((n, k) => n + count(q, k), 0); });
+    if (images) s.vision += 3;
+    const total = CLUSTERS.reduce((n, c) => n + s[c], 0);
+    const w = {};
+    CLUSTERS.forEach((c) => { w[c] = s[c] / total; });
+    const max = Math.max(...CLUSTERS.map((c) => s[c]));
+    const t = q.trim().replace(/^[ ?!.]+|[ ?!.]+$/g, "");
+    const trivial = !images && (TRIVIAL.includes(t) || (t.length < 25 && max < 1));
+    return { w, trivial };
+  }
+
+  function plan(d, opts) {
+    let p = { ...d.w };
+    const reasons = [];
+    if (opts.collapse) {
+      CLUSTERS.forEach((c) => { p[c] = (1 - MIX) * p[c] + MIX * 0.25; });
+      reasons.push("Collapse fallback: distribution mixed 50% toward uniform.");
+    }
+    if (d.trivial && !opts.images) return { p, path: "fast", selected: [], merge: {}, reasons: reasons.concat("Conductor marked the query trivial.") };
+    const forced = [];
+    if (opts.images) { forced.push("vision"); reasons.push("Image attached: vision forced."); }
+    if (opts.long) { forced.push("long_ctx"); reasons.push("Context over threshold: long_ctx forced."); }
+    const ranked = [...CLUSTERS].sort((a, b) => p[b] - p[a]);
+    let cand = forced.concat(ranked.filter((c) => !forced.includes(c) && p[c] >= MIN_W));
+    if (!cand.length) cand = ranked.slice(0, 1);
+    const selected = [];
+    cand.forEach((c) => {
+      if (selected.length >= CAP) reasons.push(`Capacity factor dropped ${c} (p = ${p[c].toFixed(2)}).`);
+      else selected.push(c);
+    });
+    const eff = {};
+    selected.forEach((c) => { eff[c] = forced.includes(c) ? Math.max(p[c], MIN_W) : p[c]; });
+    const mass = selected.reduce((n, c) => n + eff[c], 0) || 1;
+    const merge = {};
+    selected.forEach((c) => { merge[c] = eff[c] / mass; });
+    return { p, path: selected.length === 1 ? "single" : "multi", selected, merge, reasons };
+  }
+
+  const NAMES = { code: "Code", reasoning: "Reasoning", vision: "Vision", long_ctx: "Long-Context" };
+
+  function render() {
+    const opts = { images: $("img").checked, long: $("long").checked, collapse: $("collapse").checked };
+    const r = plan(conductor($("q").value, opts.images), opts);
+    $("bars").innerHTML = CLUSTERS.map((c) => {
+      const on = r.selected.includes(c);
+      return `<div class="b${on ? " on" : ""}"><span>${c}</span><div class="track"><i style="width:${(r.p[c] * 100).toFixed(1)}%"></i><span class="thr" style="left:${MIN_W * 100}%"></span></div><span class="p">${r.p[c].toFixed(2)}</span></div>`;
+    }).join("");
+    let headline;
+    if (r.path === "fast") headline = "Fast path only. The Latency Floor answers directly and synthesis is skipped.";
+    else if (r.path === "single") headline = `k = 1 · ${NAMES[r.selected[0]]} streams straight to the user.`;
+    else headline = `k = 2 · ${r.selected.map((c) => `${NAMES[c]} ${r.merge[c].toFixed(2)}`).join(" + ")} → weighted synthesis`;
+    const items = ["Fast path fired in parallel (always)."].concat(r.reasons);
+    $("verdict").innerHTML = `<span class="label">Plan</span><span class="path">${headline}</span><ul>${items.map((x) => `<li>${x}</li>`).join("")}</ul>`;
+  }
+
+  ["q", "img", "long", "collapse"].forEach((id) => $(id).addEventListener("input", render));
+  document.querySelectorAll(".examples button").forEach((b) => b.addEventListener("click", () => {
+    $("q").value = b.dataset.q;
+    $("img").checked = !!b.dataset.img;
+    $("long").checked = !!b.dataset.long;
+    render();
+  }));
+  render();
+})();
+</script>

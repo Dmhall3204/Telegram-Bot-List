@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Namespace
+metadata: {name: conductor}
+---
+# Create secrets out of band:
+#   kubectl -n conductor create secret generic conductor-secrets \
+#     --from-literal=vllm-api-key=$(openssl rand -hex 24) \
+#     --from-literal=conductor-api-keys=<comma-separated client keys> \
+#     --from-literal=hf-token=<optional>
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: hf-cache, namespace: conductor}
+spec:
+  accessModes: [ReadWriteMany]
+  resources: {requests: {storage: 500Gi}}

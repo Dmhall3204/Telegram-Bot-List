@@ -1,0 +1,182 @@
+# Conductor pool v0.3 - L0 Conductor + L1 Specialists
+#
+# Every *_URL defaults to mock:// so the service boots with no GPUs.
+# In production set each *_URL to the vLLM/SGLang OpenAI-compatible base URL,
+# e.g. CODE_URL=http://vllm-code:8000/v1 (see deploy/).
+version: "0.3"
+
+conductor:
+  name: Conductor
+  total_params_b: 30.5
+  active_params_b: 3.3
+  experts: 128
+  experts_per_token: 8
+  native_context: 32768
+  routing_max_tokens: 512
+  routing_input_chars: 12000
+  route_retries: 1
+  endpoint:
+    base_url: ${CONDUCTOR_URL:-mock://conductor}
+    model: ${CONDUCTOR_MODEL:-Qwen/Qwen3-30B-A3B-FP8}
+    api_key_env: VLLM_API_KEY
+    timeout_s: 30
+    max_tokens: 4096
+    temperature: 0.0
+    top_p: 1.0
+    extra_body:
+      chat_template_kwargs: {enable_thinking: false}
+  routing_prompt: |
+    You are the L0 Conductor of a hierarchical mixture-of-experts system.
+    Read the user query and emit a probability distribution over the specialist clusters.
+    Clusters:
+    - code: agentic coding, debugging, tool use, shell, SQL, function calling, repository-scale reasoning.
+    - reasoning: math, logic, proofs, multi-step analysis, planning, puzzles.
+    - vision: images, screenshots, charts, diagrams, OCR, visual Q&A. Only relevant if images are attached or referenced.
+    - long_ctx: long documents, RAG payloads, transcripts, full codebases, multi-document summaries.
+    Rules:
+    - weights must be non-negative and sum to 1. Spread mass only when a query truly needs several skills.
+    - set trivial=true for greetings, small talk, one-line facts, or anything a small model answers well. Weights still required.
+    - subqueries: for each cluster with weight >= 0.10, write the focused sub-task that cluster should solve. Omit others.
+    - synthesise=true when more than one cluster should contribute.
+    Respond with JSON only.
+  synthesis_prompt: |
+    You are the Conductor acting as synthesiser. Several specialist models answered parts of the
+    user's request. Each output is annotated with the routing probability you assigned it.
+    Merge them into one answer for the user:
+    - Trust higher-weighted outputs more when they conflict; use lower-weighted ones to fill gaps.
+    - Never mention specialists, weights, or this merge process.
+    - Preserve code blocks, numbers, and citations exactly when you use them.
+    - The fast draft is a low-cost reference answer; use it only for coverage, never over a specialist.
+
+specialists:
+  - name: Code Specialist
+    cluster: code
+    role: agentic coding & repo-scale reasoning
+    architecture: moe
+    total_params_b: 30.5
+    active_params_b: 3.3
+    experts: 128
+    experts_per_token: 8
+    native_context: 262144
+    system_prompt: You are an expert software engineer. Produce correct, runnable code and concise explanations.
+    endpoint:
+      base_url: ${CODE_URL:-mock://code}
+      model: ${CODE_MODEL:-Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8}
+      api_key_env: VLLM_API_KEY
+      max_tokens: 4096
+      temperature: 0.7
+      top_p: 0.8
+      extra_body: {top_k: 20, repetition_penalty: 1.05}
+
+  - name: Reasoning Specialist
+    cluster: reasoning
+    role: deep reasoning, math, logic, planning
+    architecture: moe
+    total_params_b: 80
+    active_params_b: 3
+    experts: 512
+    experts_per_token: 10
+    shared_experts: 1
+    native_context: 262144
+    returns_reasoning: true
+    system_prompt: You are a rigorous reasoner. Think step by step, verify each step, then state the final answer clearly.
+    endpoint:
+      base_url: ${REASONING_URL:-mock://reasoning}
+      model: ${REASONING_MODEL:-Qwen/Qwen3-Next-80B-A3B-Thinking-FP8}
+      api_key_env: VLLM_API_KEY
+      timeout_s: 300
+      max_tokens: 16384
+      temperature: 0.6
+      top_p: 0.95
+      extra_body: {top_k: 20}
+
+  - name: Vision Specialist
+    cluster: vision
+    role: native multimodal understanding
+    architecture: moe
+    total_params_b: 31
+    active_params_b: 3
+    experts: 128
+    experts_per_token: 8
+    native_context: 262144
+    accepts_images: true
+    system_prompt: You are a vision-language expert. Read images precisely, including text, charts, tables and UI.
+    endpoint:
+      base_url: ${VISION_URL:-mock://vision}
+      model: ${VISION_MODEL:-Qwen/Qwen3-VL-30B-A3B-Instruct}
+      api_key_env: VLLM_API_KEY
+      max_tokens: 4096
+      temperature: 0.7
+      top_p: 0.8
+      extra_body: {top_k: 20}
+
+  - name: Long-Context Specialist
+    cluster: long_ctx
+    role: long-document synthesis & retrieval
+    architecture: moe
+    total_params_b: 30.5
+    active_params_b: 3.3
+    experts: 128
+    experts_per_token: 8
+    native_context: 262144
+    system_prompt: You synthesise long documents faithfully. Quote or cite the relevant passages that support each claim.
+    endpoint:
+      base_url: ${LONG_CTX_URL:-mock://long_ctx}
+      model: ${LONG_CTX_MODEL:-Qwen/Qwen3-30B-A3B-Instruct-2507-FP8}
+      api_key_env: VLLM_API_KEY
+      timeout_s: 300
+      max_tokens: 8192
+      temperature: 0.7
+      top_p: 0.8
+      extra_body: {top_k: 20}
+
+fast_path:
+  name: Latency Floor
+  cluster: fast
+  role: latency floor & always-on shadow
+  architecture: dense
+  total_params_b: 4
+  active_params_b: 4
+  native_context: 262144
+  system_prompt: You are a fast, helpful assistant. Answer directly and concisely.
+  endpoint:
+    base_url: ${FAST_URL:-mock://fast}
+    model: ${FAST_MODEL:-Qwen/Qwen3-4B-Instruct-2507-FP8}
+    api_key_env: VLLM_API_KEY
+    timeout_s: 30
+    max_tokens: 1024
+    temperature: 0.7
+    top_p: 0.8
+  breaker: {failure_threshold: 10, window_s: 60, cooldown_s: 15}
+
+routing:
+  capacity_factor: 2
+  min_weight: 0.10
+  images_force_vision: true
+  long_ctx_force_tokens: 24000
+  collapse_uniform_mix: 0.5
+
+monitor:
+  store: ${MONITOR_STORE:-memory}
+  redis_url: ${REDIS_URL:-redis://localhost:6379/0}
+  balance_window_s: 86400
+  balance_low: 0.05
+  balance_high: 0.60
+  balance_min_samples: 500
+  collapse_window_s: 3600
+  collapse_high: 0.80
+  collapse_low: 0.02
+  collapse_min_samples: 100
+  uniform_hold_s: 900
+  check_interval_s: 30
+  alert_webhook_url: ${ALERT_WEBHOOK_URL:-}
+
+synthesis:
+  max_tokens: 4096
+  temperature: 0.4
+  max_chars_per_output: 24000
+  attach_fast_path: true
+
+telemetry:
+  service_name: conductor
+  otlp_endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}

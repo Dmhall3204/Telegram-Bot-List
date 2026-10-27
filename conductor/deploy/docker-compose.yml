@@ -1,0 +1,106 @@
+# Single-node reference deployment: 6x 80GB GPUs (H100/H200/A100-80G).
+#   GPU0  Conductor (L0, FP8) + Latency Floor (dense 4B, FP8)  shared
+#   GPU1  Code Specialist (FP8)
+#   GPU2-3 Reasoning Specialist (80B FP8, TP=2)
+#   GPU4  Vision Specialist (BF16: vision tower kept at full precision)
+#   GPU5  Long-Context Specialist (FP8)
+# vLLM enforces auth from the VLLM_API_KEY env var. Usage:
+#   export VLLM_API_KEY=$(openssl rand -hex 24) HF_TOKEN=...
+#   printf %s "$VLLM_API_KEY" > prometheus/vllm_api_key && docker compose up -d
+x-vllm: &vllm
+  image: vllm/vllm-openai:v0.11.0
+  ipc: host
+  restart: unless-stopped
+  environment:
+    HF_TOKEN: ${HF_TOKEN:-}
+    VLLM_API_KEY: ${VLLM_API_KEY:?set VLLM_API_KEY}
+  volumes:
+    - hf-cache:/root/.cache/huggingface
+  healthcheck:
+    test: ["CMD", "python3", "-c", "import os,urllib.request as u; u.urlopen(u.Request('http://127.0.0.1:8000/v1/models', headers={'Authorization': 'Bearer ' + os.environ['VLLM_API_KEY']}), timeout=4)"]
+    interval: 30s
+    timeout: 5s
+    retries: 60
+    start_period: 600s
+
+services:
+  vllm-conductor:
+    <<: *vllm
+    command: >
+      --model Qwen/Qwen3-30B-A3B-FP8 --max-model-len 32768
+      --gpu-memory-utilization 0.55 --enable-prefix-caching
+    deploy: {resources: {reservations: {devices: [{driver: nvidia, device_ids: ["0"], capabilities: [gpu]}]}}}
+
+  vllm-fast:
+    <<: *vllm
+    command: >
+      --model Qwen/Qwen3-4B-Instruct-2507-FP8 --max-model-len 32768
+      --gpu-memory-utilization 0.30 --enable-prefix-caching
+    deploy: {resources: {reservations: {devices: [{driver: nvidia, device_ids: ["0"], capabilities: [gpu]}]}}}
+
+  vllm-code:
+    <<: *vllm
+    command: >
+      --model Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 --max-model-len 262144
+      --gpu-memory-utilization 0.92 --enable-auto-tool-choice --tool-call-parser qwen3_coder
+    deploy: {resources: {reservations: {devices: [{driver: nvidia, device_ids: ["1"], capabilities: [gpu]}]}}}
+
+  vllm-reasoning:
+    <<: *vllm
+    command: >
+      --model Qwen/Qwen3-Next-80B-A3B-Thinking-FP8 --tensor-parallel-size 2
+      --max-model-len 262144 --gpu-memory-utilization 0.92 --reasoning-parser deepseek_r1
+    deploy: {resources: {reservations: {devices: [{driver: nvidia, device_ids: ["2", "3"], capabilities: [gpu]}]}}}
+
+  vllm-vision:
+    <<: *vllm
+    command: >
+      --model Qwen/Qwen3-VL-30B-A3B-Instruct --dtype bfloat16 --max-model-len 131072
+      --gpu-memory-utilization 0.92 --limit-mm-per-prompt {"image":8,"video":0}
+    deploy: {resources: {reservations: {devices: [{driver: nvidia, device_ids: ["4"], capabilities: [gpu]}]}}}
+
+  vllm-long-ctx:
+    <<: *vllm
+    # Native 262K. For 1M add: --rope-scaling '{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":262144}'
+    # --max-model-len 1010000 (needs far more KV memory than one GPU; use TP>=4).
+    command: >
+      --model Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 --max-model-len 262144
+      --gpu-memory-utilization 0.92 --enable-prefix-caching
+    deploy: {resources: {reservations: {devices: [{driver: nvidia, device_ids: ["5"], capabilities: [gpu]}]}}}
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+  conductor:
+    build: ..
+    restart: unless-stopped
+    ports: ["8080:8080"]
+    environment:
+      VLLM_API_KEY: ${VLLM_API_KEY}
+      CONDUCTOR_API_KEYS: ${CONDUCTOR_API_KEYS:-}
+      CONDUCTOR_URL: http://vllm-conductor:8000/v1
+      FAST_URL: http://vllm-fast:8000/v1
+      CODE_URL: http://vllm-code:8000/v1
+      REASONING_URL: http://vllm-reasoning:8000/v1
+      VISION_URL: http://vllm-vision:8000/v1
+      LONG_CTX_URL: http://vllm-long-ctx:8000/v1
+      MONITOR_STORE: redis
+      REDIS_URL: redis://redis:6379/0
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+    depends_on:
+      redis: {condition: service_started}
+      vllm-conductor: {condition: service_healthy}
+      vllm-fast: {condition: service_healthy}
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    restart: unless-stopped
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+    ports: ["9090:9090"]
+
+volumes:
+  hf-cache:
