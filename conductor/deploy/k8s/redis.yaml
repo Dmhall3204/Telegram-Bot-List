@@ -1,0 +1,22 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: redis, namespace: conductor}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: redis}}
+  template:
+    metadata: {labels: {app: redis}}
+    spec:
+      containers:
+        - name: redis
+          image: redis:7.4-alpine
+          args: ["--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "volatile-ttl"]
+          ports: [{containerPort: 6379}]
+          resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {memory: 320Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: redis, namespace: conductor}
+spec:
+  selector: {app: redis}
+  ports: [{port: 6379}]

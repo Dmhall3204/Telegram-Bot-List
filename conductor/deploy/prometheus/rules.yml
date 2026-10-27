@@ -1,0 +1,27 @@
+groups:
+  - name: conductor
+    rules:
+      - alert: ConductorLoadImbalance
+        expr: conductor_load_share{window="balance"} < 0.05 or conductor_load_share{window="balance"} > 0.60
+        for: 30m
+        labels: {severity: warning}
+        annotations: {summary: "Cluster {{ $labels.cluster }} share {{ $value | humanizePercentage }} over 24h; review router prompt"}
+      - alert: ConductorRoutingCollapse
+        expr: conductor_uniform_mode == 1
+        labels: {severity: critical}
+        annotations: {summary: "Routing collapse detected; uniform-mix fallback active, manual router review required"}
+      - alert: ConductorSpecialistBreakerOpen
+        expr: conductor_breaker_open == 1
+        for: 2m
+        labels: {severity: critical}
+        annotations: {summary: "Specialist {{ $labels.cluster }} circuit breaker open"}
+      - alert: ConductorRouterFallbacks
+        expr: sum(rate(conductor_router_fallbacks_total[5m])) / sum(rate(conductor_requests_total[5m])) > 0.02
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "More than 2% of requests fall back from L0 to the fast path"}
+      - alert: ConductorFastPathSlow
+        expr: histogram_quantile(0.95, sum by (le) (rate(conductor_fast_path_ttft_seconds_bucket[5m]))) > 0.2
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "Fast-path p95 TTFT above the 200ms latency floor"}

@@ -1,0 +1,5 @@
+tests/
+site/
+deploy/
+**/__pycache__
+.pytest_cache
